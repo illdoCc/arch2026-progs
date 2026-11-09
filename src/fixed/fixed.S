@@ -16,7 +16,7 @@
     .type   op1_asm, @function
     .align  2
 op1_asm:
-    sw zero, 0(a2)  # *n = 0
+    li t1, 0        # the value of n
     beq a1, zero, op1_ret
 op1_loop:
     and t0, a0, a1  # c = (a & b) << 1
@@ -24,12 +24,11 @@ op1_loop:
     xor a0, a0, a1  # a = a ^ b
     mv a1, t0       # b = c
 
-    lw t1, 0(a2)        # ++*n
     addi t1, t1, 1
-    sw t1, 0(a2)
 
     bne a1, zero, op1_loop
 op1_ret:
+    sw t1, 0(a2)    # store back to *n
     ret
     .size   op1_asm, .-op1_asm
 
@@ -107,18 +106,16 @@ mul_b_ready:
 mul_loop:
     andi t0, a1, 1                 # if (ub & 1)
     beq t0, zero, result_not_add
-    add t1, s0, s2                 # low 32 bits of result += ua
-    sltu t2, t1, s0
-    mv s0, t1
+    add s0, s0, s2                 # low 32 bits of result += ua
+    sltu t2, s0, s2
     add s1, s1, s3                 # high 32 bits of result += ua
     add s1, s1, t2
 result_not_add:
     srli a1, a1, 1                 # ub >>= 1
-    slli t1, s2, 1                 # ua <<= 1
-    sltu t2, t1, s2
-    mv s2, t1
+    srli t2, s2, 31                # ua <<= 1
+    slli s2, s2, 1
     slli s3, s3, 1
-    add s3, s3, t2
+    or s3, s3, t2
     bne a1, zero, mul_loop
 mul_end:
     beq t3, zero, mul_round
@@ -129,9 +126,8 @@ mul_end:
     sltu t2, t1, s0
     mv s0, t1
     add s1, s1, t2
-
 mul_round:
-    li t0, 524288
+    li t0, 524288                  # (1 << 19)
     add t1, s0, t0                 # product += (1 << 19)
     sltu t2, t1, s0
     mv s0, t1
