@@ -1,5 +1,6 @@
 #include "rubik.h"
 #include "rt.h"
+#include "rubik_tail.h"
 
 enum {
     CUBIES = 7,
@@ -315,6 +316,52 @@ static inline int init_search(search_t *search)
                            search->orientation_distance, queue);
 }
 
+/* The low 23 bits identify the complete state; upper bits hold its suffix.
+ * Unlike the component heuristic, this table gives an exact distance.
+ */
+static uint32_t find_tail(uint16_t p, uint16_t o)
+{
+    uint32_t key = ((uint32_t) p << 10) | o;
+    size_t low = 0, high = sizeof(rubik_tail) / sizeof(rubik_tail[0]);
+    while (low < high) {
+        size_t mid = low + ((high - low) >> 1);
+        uint32_t entry = rubik_tail[mid];
+        uint32_t candidate = entry & 0x7fffffu;
+        if (candidate == key)
+            return entry;
+        if (candidate < key)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return UINT32_MAX;
+}
+
+/* Follow stored moves toward solved. Each move reduces the exact distance
+ * by one, and every intermediate state is also present in the tail table.
+ */
+static int append_tail(search_t *search,
+                       uint16_t p,
+                       uint16_t o,
+                       uint8_t depth,
+                       uint32_t entry)
+{
+    uint8_t length = (uint8_t) (depth + ((entry >> 23) & 7U));
+    while (depth < length) {
+        uint8_t move = (uint8_t) ((entry >> 26) & 15U);
+        search->path[depth++] = move;
+        uint8_t face = (uint8_t) ((move >= 3U) + (move >= 6U));
+        uint8_t turns = (uint8_t) (move - ((face << 1) + face) + 1U);
+        for (uint8_t turn = 0; turn < turns; ++turn) {
+            p = search->permutation[face][p];
+            o = search->orientation[face][o];
+        }
+        if (depth < length)
+            entry = find_tail(p, o);
+    }
+    return length;
+}
+
 /* Search from the input ranks to solved within limit moves. Return the path
  * length, or -1 if no solution is found or the ranks/limit are out of range.
  * Only path[0..length-1] is valid on success; this is not yet optimal search.
@@ -338,6 +385,21 @@ static inline int search_limited(search_t *search,
             lower_bound = search->orientation_distance[frame->o];
         if (depth == limit || frame->next_move == MOVES ||
             depth + lower_bound > limit) {
+            if (depth == 0)
+                return -1;
+            --depth;
+            continue;
+        }
+
+        /* With at most five moves left, the complete table decides whether
+         * this branch can finish. No entry means its distance is above five.
+         * Iterative deepening still chooses the shortest complete solution.
+         */
+        uint8_t remaining = (uint8_t) (limit - depth);
+        if (remaining <= RUBIK_TAIL_DEPTH) {
+            uint32_t entry = find_tail(frame->p, frame->o);
+            if (entry != UINT32_MAX && ((entry >> 23) & 7U) <= remaining)
+                return append_tail(search, frame->p, frame->o, depth, entry);
             if (depth == 0)
                 return -1;
             --depth;

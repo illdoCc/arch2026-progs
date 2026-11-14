@@ -1,4 +1,5 @@
-# Bare-metal port of HW1 solver.s. Search tables are in rubik_tables.S.
+# Bare-metal port of HW1 solver.s. Component tables: rubik_tables.S.
+# Exact five-move suffix table: rubik_tail.S.
 # int rubik_solve_asm(const char *state, char *out, size_t cap)
 # a0 = state, a1 = out, a2 = cap; a0 returns the move count, -1 or -2.
 # Only RV32I instructions; the caller supplies the stack and performs all I/O.
@@ -360,20 +361,21 @@ search_limited:
     li t0, 11                   # if (limit > MAX_DEPTH) return -1;
     bltu t0, a2, search_limited_invalid
 
-    # stack[12]: 72 bytes; saved s0-s5: 24 bytes. Total: 96 bytes.
+    # stack[12]: 72 bytes; saved s0-s5 and ra; pad to 112 bytes.
     # Each entry: p at +0, o at +2, next_move at +4, previous_face at +5.
-    addi sp, sp, -96            # search_frame_t stack[MAX_DEPTH + 1];
+    addi sp, sp, -112           # search_frame_t stack[MAX_DEPTH + 1];
     sw s0, 72(sp)
     sw s1, 76(sp)
     sw s2, 80(sp)
     sw s3, 84(sp)
     sw s4, 88(sp)
     sw s5, 92(sp)
+    sw ra, 108(sp)
     la s2, rubik_asm_permutation_distance # Keep the four table bases across iterations
     la s3, rubik_asm_orientation_distance
     la s4, rubik_asm_permutation_table
     la s5, rubik_asm_orientation_table
-    la a6, search_path         # No nested calls; a6 keeps the path base
+    la a6, search_path         # find_tail preserves a6 and t0-t2
     li s0, 0                   # depth = 0; keep depth in s0
     mv s1, a2                  # Keep limit in s1
     sh a0, 0(sp)               # stack[0] = (search_frame_t) {p, o, 0};
@@ -403,6 +405,26 @@ search_limited_loop:
 search_limited_bound:
     add t3, s0, t3             # depth + lower_bound > limit
     bltu s1, t3, search_limited_backtrack
+
+    # Keep the heuristic, but decide the last five moves by exact lookup.
+    sub t3, s1, s0
+    li t4, 5
+    bltu t4, t3, search_limited_next_move
+    mv a0, t1
+    mv a1, t2
+    call find_tail            # Preserves frame, p, o and path base
+    li t3, -1
+    beq a0, t3, search_limited_backtrack
+    srli t3, a0, 23
+    andi t3, t3, 7            # Exact distance from this state to solved
+    sub t4, s1, s0
+    bltu t4, t3, search_limited_backtrack
+    mv a3, a0
+    mv a0, t1
+    mv a1, t2
+    mv a2, s0
+    call append_tail
+    j search_limited_return
 
 search_limited_next_move:
     # This node already passed the bound; only next_move has changed.
@@ -477,14 +499,129 @@ search_limited_solved:
 search_limited_failed:
     li a0, -1
 search_limited_return:
+    lw ra, 108(sp)
     lw s5, 92(sp)
     lw s4, 88(sp)
     lw s3, 84(sp)
     lw s2, 80(sp)
     lw s1, 76(sp)
     lw s0, 72(sp)
-    addi sp, sp, 96
+    addi sp, sp, 112
     ret
 search_limited_invalid:
     li a0, -1
     ret
+
+# find_tail(p, o): a0 = p, a1 = o; return packed entry or -1 in a0.
+# Clobbers a0-a5 and t3 only. Preserve t0-t2 and a6 for search_limited.
+# Search by the low 23 bits: metadata does not participate in the ordering.
+    .type find_tail, @function
+find_tail:
+    slli a0, a0, 10
+    or a1, a0, a1             # key = (p << 10) | o
+    la a2, rubik_asm_tail
+    la a3, rubik_asm_tail_end
+    li a4, 0x7fffff
+.Ltail_find_loop:
+    bgeu a2, a3, .Ltail_not_found
+    sub a5, a3, a2
+    srli a5, a5, 3            # Half the number of 4-byte entries
+    slli a5, a5, 2
+    add a5, a2, a5            # Aligned midpoint of [low, high)
+    lw a0, 0(a5)
+    and t3, a0, a4
+    beq t3, a1, .Ltail_found
+    bltu t3, a1, .Ltail_find_right
+    mv a3, a5
+    j .Ltail_find_loop
+.Ltail_find_right:
+    addi a2, a5, 4
+    j .Ltail_find_loop
+.Ltail_not_found:
+    li a0, -1
+.Ltail_found:
+    ret
+    .size find_tail, .-find_tail
+
+# append_tail(p, o, depth, entry): a0-a3 are the arguments.
+# Return prefix + suffix length in a0, filling search_path from depth onward.
+# s0/s1 = ranks; s2 = depth; s3 = final length; s4/s5 = transition bases;
+# s6 = path base. Stored moves reduce distance by one, so every lookup exists.
+    .type append_tail, @function
+append_tail:
+    addi sp, sp, -32
+    sw ra, 28(sp)
+    sw s0, 24(sp)
+    sw s1, 20(sp)
+    sw s2, 16(sp)
+    sw s3, 12(sp)
+    sw s4, 8(sp)
+    sw s5, 4(sp)
+    sw s6, 0(sp)
+    mv s0, a0
+    mv s1, a1
+    mv s2, a2
+    srli s3, a3, 23
+    andi s3, s3, 7
+    add s3, s3, s2
+    la s4, rubik_asm_permutation_table
+    la s5, rubik_asm_orientation_table
+    la s6, search_path
+.Ltail_append_loop:
+    bgeu s2, s3, .Ltail_append_done
+    srli t0, a3, 26
+    andi t0, t0, 15
+    add t1, s6, s2
+    sb t0, 0(t1)
+    addi s2, s2, 1
+
+    # face = 2 - (move < 3) - (move < 6), without division.
+    sltiu t1, t0, 3
+    sltiu t2, t0, 6
+    add t1, t1, t2
+    li t2, 2
+    sub t1, t2, t1
+    slli t2, t1, 1
+    add t2, t2, t1
+    sub t2, t0, t2
+    addi t2, t2, 1            # turns = move - 3 * face + 1
+
+    mv t4, s4
+    mv t5, s5
+    beq t1, zero, .Ltail_apply_turn
+    li t6, 10080              # Bytes per permutation row
+    li a0, 1458               # Bytes per orientation row
+    add t4, t4, t6
+    add t5, t5, a0
+    li t0, 1
+    beq t1, t0, .Ltail_apply_turn
+    add t4, t4, t6
+    add t5, t5, a0
+.Ltail_apply_turn:
+    slli t0, s0, 1
+    add t0, t4, t0
+    lhu s0, 0(t0)
+    slli t0, s1, 1
+    add t0, t5, t0
+    lhu s1, 0(t0)
+    addi t2, t2, -1
+    bne t2, zero, .Ltail_apply_turn
+    beq s2, s3, .Ltail_append_done
+    mv a0, s0
+    mv a1, s1
+    call find_tail
+    mv a3, a0
+    j .Ltail_append_loop
+.Ltail_append_done:
+    mv a0, s3
+    lw s6, 0(sp)
+    lw s5, 4(sp)
+    lw s4, 8(sp)
+    lw s3, 12(sp)
+    lw s2, 16(sp)
+    lw s1, 20(sp)
+    lw s0, 24(sp)
+    lw ra, 28(sp)
+    addi sp, sp, 32
+    ret
+    .size append_tail, .-append_tail
