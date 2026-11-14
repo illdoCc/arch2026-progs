@@ -1,10 +1,469 @@
 #include "rubik.h"
+#include "rt.h"
 
-/* Dummy: reports every state as invalid. Replace with the optimal solver. */
+enum {
+    CUBIES = 7,
+    PERMUTATIONS = 5040,
+    ORIENTATIONS = 729,
+    MOVES = 9,
+    MAX_DEPTH = 11
+};
+
+typedef struct {
+    uint8_t p[CUBIES], o[CUBIES];
+} state_t;
+
+/* Transition tables and distance tables. */
+typedef struct {
+    uint16_t permutation[3][PERMUTATIONS], orientation[3][ORIENTATIONS];
+    uint8_t permutation_distance[PERMUTATIONS];
+    uint8_t orientation_distance[ORIENTATIONS];
+    uint8_t path[MAX_DEPTH]; /* Filled by the search when it visits a child. */
+} search_t;
+
+typedef struct {
+    uint16_t p, o;
+    uint8_t next_move;
+} search_frame_t;
+
+/*@ predicate valid_state(state_t *state) =
+      (\forall integer i; 0 <= i < CUBIES ==>
+         state->p[i] < CUBIES && state->o[i] < 3) &&
+      (\forall integer i, j; 0 <= i < j < CUBIES ==>
+         state->p[i] != state->p[j]) &&
+      (state->o[0] + state->o[1] + state->o[2] + state->o[3] +
+       state->o[4] + state->o[5] + state->o[6]) % 3 == 0;
+ */
+
+static const char *const move_names[MOVES] = {"R",  "R2", "R'", "B", "B2",
+                                              "B'", "D",  "D2", "D'"};
+/* Each destination takes a cubie from source[face][destination]. */
+static const uint8_t source[3][CUBIES] = {
+    {1, 4, 2, 0, 3, 5, 6},
+    {0, 1, 2, 4, 5, 6, 3},
+    {0, 2, 5, 3, 1, 4, 6},
+};
+static const uint8_t twist[3][CUBIES] = {
+    {1, 2, 0, 2, 1, 0, 0},
+    {0, 0, 0, 1, 2, 1, 2},
+    {0, 0, 0, 0, 0, 0, 0},
+};
+
+/* The three quarter-turns preserve the fixed front-upper-left corner. */
+/*@ requires face < 3;
+    assigns \nothing;
+    ensures \forall integer i; 0 <= i < CUBIES ==>
+              \result.p[i] == state.p[source[face][i]];
+    ensures \forall integer i; 0 <= i < CUBIES ==>
+              \result.o[i] == (state.o[source[face][i]] + twist[face][i]) % 3;
+ */
+static state_t quarter_turn(state_t state, uint8_t face)
+{
+    state_t result;
+    /*@ loop invariant 0 <= i <= CUBIES;
+        loop invariant \forall integer j; 0 <= j < i ==>
+          result.p[j] == state.p[source[face][j]];
+        loop invariant \forall integer j; 0 <= j < i ==>
+          result.o[j] == (state.o[source[face][j]] + twist[face][j]) % 3;
+        loop assigns i, result.p[0..6], result.o[0..6];
+        loop variant CUBIES - i;
+    */
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        uint8_t from = source[face][i];
+        result.p[i] = state.p[from];
+        /* Both terms are at most 2, so one subtraction reduces modulo 3. */
+        uint8_t orientation = (uint8_t) (state.o[from] + twist[face][i]);
+        result.o[i] = orientation >= 3U ? orientation - 3U : orientation;
+    }
+    return result;
+}
+
+/*@ requires \valid_read(state);
+    requires \forall integer i; 0 <= i < CUBIES ==>
+      0 <= state->p[i] < CUBIES;
+    requires \forall integer i, j; 0 <= i < j < CUBIES ==>
+      state->p[i] != state->p[j];
+    requires \forall integer i; 0 <= i < CUBIES ==>
+      0 <= state->o[i] < 3;
+    requires \valid(permutation_rank) && \valid(orientation_rank);
+    requires \separated(state, permutation_rank, orientation_rank);
+    assigns *permutation_rank, *orientation_rank;
+    ensures *permutation_rank < PERMUTATIONS;
+    ensures *orientation_rank < ORIENTATIONS;
+ */
+static void rank_components(const state_t *state,
+                            uint16_t *permutation_rank,
+                            uint16_t *orientation_rank)
+{
+    uint32_t p = 0, o = 0;
+    /*@ loop invariant 0 <= i <= CUBIES;
+        loop invariant (i == 0 ==> p == 0) && (i == 1 ==> p <= 6) &&
+          (i == 2 ==> p <= 41) && (i == 3 ==> p <= 209) &&
+          (i == 4 ==> p <= 839) && (i == 5 ==> p <= 2519) &&
+          (i >= 6 ==> p <= 5039);
+        loop assigns i, p;
+        loop variant CUBIES - i;
+     */
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        uint8_t smaller = 0;
+        /*@ loop invariant i + 1 <= j <= CUBIES;
+            loop invariant smaller <= j - i - 1;
+            loop assigns j, smaller;
+            loop variant CUBIES - j;
+         */
+        for (uint8_t j = (uint8_t) (i + 1U); j < CUBIES; ++j)
+            if (state->p[j] < state->p[i])
+                ++smaller;
+        /* The multiplier decreases from 7 to 1; p starts at zero. */
+        switch (CUBIES - i) {
+        case 7:
+            p = 0;
+            break;
+        case 6:
+            p = (p << 2) + (p << 1);
+            break;
+        case 5:
+            p = (p << 2) + p;
+            break;
+        case 4:
+            p <<= 2;
+            break;
+        case 3:
+            p = (p << 1) + p;
+            break;
+        case 2:
+            p <<= 1;
+            break;
+        case 1:
+            break;
+        }
+        p += smaller;
+    }
+    /*@ loop invariant 0 <= i <= 6;
+        loop invariant (i == 0 ==> o == 0) && (i == 1 ==> o < 3) &&
+          (i == 2 ==> o < 9) && (i == 3 ==> o < 27) &&
+          (i == 4 ==> o < 81) && (i == 5 ==> o < 243) &&
+          (i == 6 ==> o < 729);
+        loop assigns i, o;
+        loop variant 6 - i;
+     */
+    for (uint8_t i = 0; i < 6; ++i)
+        o = (o << 1) + o + state->o[i];
+    *permutation_rank = (uint16_t) p;
+    *orientation_rank = (uint16_t) o;
+}
+
+/*@ requires \valid(state);
+    requires p < PERMUTATIONS && o < ORIENTATIONS;
+    assigns *state;
+ */
+static void unrank_components(uint32_t p, uint32_t o, state_t *state)
+{
+    static const uint16_t permutation_weight[CUBIES] = {720, 120, 24, 6,
+                                                        2,   1,   1};
+    static const uint16_t orientation_weight[6] = {243, 81, 27, 9, 3, 1};
+    uint8_t available[CUBIES] = {0, 1, 2, 3, 4, 5, 6};
+    uint8_t sum = 0;
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        uint16_t weight = permutation_weight[i];
+        uint8_t q = 0;
+        /* The factoradic digit is at most 6 - i. Leave the remainder in p. */
+        while (p >= weight) {
+            p -= weight;
+            ++q;
+        }
+        state->p[i] = available[q];
+        for (uint8_t j = q; j + 1 < CUBIES - i; ++j)
+            available[j] = available[j + 1U];
+    }
+    for (uint8_t i = 0; i < 6; ++i) {
+        uint16_t weight = orientation_weight[i];
+        uint8_t digit = 0;
+        /* Decode from the highest base-3 place; each digit is at most 2. */
+        while (o >= weight) {
+            o -= weight;
+            ++digit;
+        }
+        state->o[i] = digit;
+        /* Keep the running sum modulo 3; sum + digit is at most 4. */
+        sum = (uint8_t) (sum + digit);
+        if (sum >= 3U)
+            sum -= 3U;
+    }
+    state->o[6] = sum == 0 ? 0 : 3U - sum;
+}
+
+/*@ requires \valid_read(state);
+    requires \initialized(&state->p[0..6]) && \initialized(&state->o[0..6]);
+    assigns \nothing;
+    ensures \result != 0 ==> \forall integer i; 0 <= i < CUBIES ==>
+      state->p[i] < CUBIES && state->o[i] < 3;
+    ensures \result != 0 ==> \forall integer i, j; 0 <= i < j < CUBIES ==>
+      state->p[i] != state->p[j];
+    ensures \result != 0 ==>
+      (state->o[0] + state->o[1] + state->o[2] + state->o[3] +
+       state->o[4] + state->o[5] + state->o[6]) % 3 == 0;
+    ensures complete: valid_state(state) ==> \result != 0;
+ */
+static int valid(const state_t *state)
+{
+    uint8_t sum = 0;
+    /*@ loop invariant 0 <= i <= CUBIES;
+        loop invariant sum <= 2 * i;
+        loop invariant sum == (i > 0 ? state->o[0] : 0) +
+          (i > 1 ? state->o[1] : 0) + (i > 2 ? state->o[2] : 0) +
+          (i > 3 ? state->o[3] : 0) + (i > 4 ? state->o[4] : 0) +
+          (i > 5 ? state->o[5] : 0) + (i > 6 ? state->o[6] : 0);
+        loop invariant \forall integer j; 0 <= j < i ==>
+          state->p[j] < CUBIES && state->o[j] < 3;
+        loop invariant \forall integer j, k; 0 <= j < k < i ==>
+          state->p[j] != state->p[k];
+        loop assigns i, sum;
+        loop variant CUBIES - i;
+    */
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        if (state->p[i] >= CUBIES || state->o[i] >= 3)
+            return 0;
+        /*@ loop invariant 0 <= j <= i;
+            loop invariant \forall integer k; 0 <= k < j ==>
+              state->p[k] != state->p[i];
+            loop assigns j;
+            loop variant i - j;
+        */
+        for (uint8_t j = 0; j < i; ++j)
+            if (state->p[j] == state->p[i])
+                return 0;
+        sum = (uint8_t) (sum + state->o[i]);
+    }
+    /* The sum is at most 14; subtract multiples of 3 to leave 0..2. */
+    if (sum >= 12U)
+        sum -= 12U;
+    if (sum >= 6U)
+        sum -= 6U;
+    if (sum >= 3U)
+        sum -= 3U;
+    return sum == 0;
+}
+
+/* Build independent quarter-turn transitions for permutation and orientation.
+ */
+static void build_transitions(uint16_t permutation[3][PERMUTATIONS],
+                              uint16_t orientation[3][ORIENTATIONS])
+{
+    state_t state;
+    for (uint16_t rank = 0; rank < PERMUTATIONS; ++rank) {
+        unrank_components(rank, 0, &state);
+        for (uint8_t face = 0; face < 3; ++face) {
+            state_t next = quarter_turn(state, face);
+            uint16_t next_p, next_o;
+            rank_components(&next, &next_p, &next_o);
+            permutation[face][rank] = next_p;
+        }
+    }
+    for (uint16_t rank = 0; rank < ORIENTATIONS; ++rank) {
+        unrank_components(0, rank, &state);
+        for (uint8_t face = 0; face < 3; ++face) {
+            state_t next = quarter_turn(state, face);
+            uint16_t next_p, next_o;
+            rank_components(&next, &next_p, &next_o);
+            orientation[face][rank] = next_o;
+        }
+    }
+}
+
+/* Each quarter, half, or inverse turn costs one step in HTM. The caller
+ * supplies a queue so the two projected searches can reuse its storage.
+ */
+static inline int build_distances(uint16_t count,
+                                  const uint16_t *r,
+                                  const uint16_t *b,
+                                  const uint16_t *d,
+                                  uint8_t *distance,
+                                  uint16_t *queue)
+{
+    const uint16_t *transition[3] = {r, b, d};
+    uint16_t head = 0, tail = 1;
+    memset(distance, UINT8_MAX, count);
+    distance[0] = 0;
+    queue[0] = 0;
+    while (head < tail) {
+        uint16_t here = queue[head++];
+        for (uint8_t face = 0; face < 3; ++face) {
+            uint16_t next = here;
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                next = transition[face][next];
+                if (distance[next] == UINT8_MAX) {
+                    distance[next] = (uint8_t) (distance[here] + 1U);
+                    queue[tail++] = next;
+                }
+            }
+        }
+    }
+    return tail == count;
+}
+
+/* Construct transition tables and distance tables. */
+static inline int init_search(search_t *search)
+{
+    static uint16_t queue[PERMUTATIONS];
+    build_transitions(search->permutation, search->orientation);
+    return build_distances(PERMUTATIONS, search->permutation[0],
+                           search->permutation[1], search->permutation[2],
+                           search->permutation_distance, queue) &&
+           build_distances(ORIENTATIONS, search->orientation[0],
+                           search->orientation[1], search->orientation[2],
+                           search->orientation_distance, queue);
+}
+
+/* Search from the input ranks to solved within limit moves. Return the path
+ * length, or -1 if no solution is found or the ranks/limit are out of range.
+ * Only path[0..length-1] is valid on success; this is not yet optimal search.
+ */
+static inline int search_limited(search_t *search,
+                                 uint16_t p,
+                                 uint16_t o,
+                                 uint8_t limit)
+{
+    if (p >= PERMUTATIONS || o >= ORIENTATIONS || limit > MAX_DEPTH)
+        return -1;
+    search_frame_t stack[MAX_DEPTH + 1];
+    uint8_t depth = 0;
+    stack[0] = (search_frame_t) {p, o, 0};
+    for (;;) {
+        search_frame_t *frame = &stack[depth];
+        if (frame->p == 0 && frame->o == 0)
+            return depth;
+        uint8_t lower_bound = search->permutation_distance[frame->p];
+        if (search->orientation_distance[frame->o] > lower_bound)
+            lower_bound = search->orientation_distance[frame->o];
+        if (depth == limit || frame->next_move == MOVES ||
+            depth + lower_bound > limit) {
+            if (depth == 0)
+                return -1;
+            --depth;
+            continue;
+        }
+
+        /* Advance the parent before descending so backtracking resumes it. */
+        uint8_t move = frame->next_move++;
+        uint8_t face = (uint8_t) ((move >= 3U) + (move >= 6U));
+        /* Consecutive turns of one face can be combined into fewer moves. */
+        if (depth > 0) {
+            uint8_t previous = search->path[depth - 1];
+            uint8_t previous_face =
+                (uint8_t) ((previous >= 3U) + (previous >= 6U));
+            if (face == previous_face)
+                continue;
+        }
+        uint8_t turns = (uint8_t) (move - ((face << 1) + face) + 1U);
+        search_frame_t next = {frame->p, frame->o, 0};
+        for (uint8_t turn = 0; turn < turns; ++turn) {
+            next.p = search->permutation[face][next.p];
+            next.o = search->orientation[face][next.o];
+        }
+        search->path[depth] = move;
+        stack[++depth] = next;
+    }
+}
+
+/* Start at the admissible lower bound; the first successful limit is optimal.
+ * Return the solution length, or -1 on failure, as in search_limited.
+ */
+static inline int search_optimal(search_t *search, uint16_t p, uint16_t o)
+{
+    if (p >= PERMUTATIONS || o >= ORIENTATIONS)
+        return -1;
+    uint8_t lower_bound = search->permutation_distance[p];
+    if (search->orientation_distance[o] > lower_bound)
+        lower_bound = search->orientation_distance[o];
+    for (uint8_t limit = lower_bound; limit <= MAX_DEPTH; ++limit) {
+        int length = search_limited(search, p, o, limit);
+        if (length >= 0)
+            return length;
+    }
+    return -1;
+}
+
+/*@ requires valid_read_string(input);
+    requires \valid(state);
+    assigns state->p[0..6], state->o[0..6];
+    ensures \result != 0 ==> input[14] == '\0';
+    ensures \result != 0 ==> \forall integer i; 0 <= i < CUBIES ==>
+      state->p[i] < CUBIES && state->o[i] < 3;
+    ensures \result != 0 ==> \forall integer i, j; 0 <= i < j < CUBIES ==>
+      state->p[i] != state->p[j];
+    ensures \result != 0 ==>
+      (state->o[0] + state->o[1] + state->o[2] + state->o[3] +
+       state->o[4] + state->o[5] + state->o[6]) % 3 == 0;
+    ensures \result != 0 ==> \forall integer i; 0 <= i < CUBIES ==>
+      state->p[i] == input[i] - '1';
+    ensures \result != 0 ==> \forall integer i; 0 <= i < CUBIES ==>
+      state->o[i] == input[i + CUBIES] - '1';
+ */
+static int parse_state(const char *input, state_t *state)
+{
+    /*@ loop invariant 0 <= i <= 14;
+        loop invariant i <= strlen(input);
+        loop invariant i <= 7 ==> \initialized(&state->p[0..i-1]);
+        loop invariant i >= 7 ==> \initialized(&state->p[0..6]);
+        loop invariant i >= 7 ==> \initialized(&state->o[0..i-8]);
+        loop invariant \forall integer j; 0 <= j < i && j < CUBIES ==>
+          state->p[j] == input[j] - '1';
+        loop invariant \forall integer j; 0 <= j < i - CUBIES ==>
+          state->o[j] == input[j + CUBIES] - '1';
+        loop assigns i, state->p[0..6], state->o[0..6];
+        loop variant 14 - i;
+     */
+    for (int i = 0; i < 14; ++i) {
+        int limit = i < 7 ? 7 : 3;
+        if (input[i] < '1' || input[i] > '0' + limit)
+            return 0;
+        int index = i < CUBIES ? i : i - CUBIES;
+        (i < CUBIES ? state->p : state->o)[index] = (uint8_t) (input[i] - '1');
+    }
+    return input[14] == '\0' && valid(state);
+}
+
 int rubik_solve(const char *state, char *out, size_t cap)
 {
-    (void) state;
-    (void) out;
-    (void) cap;
-    return -1;
+    state_t s;
+    if (!parse_state(state, &s)) {
+        return -1;
+    }
+    static search_t search;
+    if (!init_search(&search)) {
+        return 1;
+    }
+    uint16_t p, o;
+    rank_components(&s, &p, &o);
+    int length = search_optimal(&search, p, o);
+    if (length < 0) {
+        return 1;
+    }
+    /* Include separators and the terminating NUL in the required capacity. */
+    size_t needed = 1;
+    for (int i = 0; i < length; ++i) {
+        if (i > 0)
+            ++needed;
+        const char *name = move_names[search.path[i]];
+        for (size_t j = 0; name[j] != '\0'; ++j)
+            ++needed;
+    }
+
+    if (cap < needed) {
+        if (cap > 0)
+            out[0] = '\0';
+        return -2;
+    }
+
+    size_t pos = 0;
+    for (int i = 0; i < length; ++i) {
+        if (i > 0)
+            out[pos++] = ' ';
+        const char *name = move_names[search.path[i]];
+        for (size_t j = 0; name[j] != '\0'; ++j)
+            out[pos++] = name[j];
+    }
+    out[pos] = '\0';
+    return length;
 }
